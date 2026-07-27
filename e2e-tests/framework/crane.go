@@ -47,10 +47,9 @@ type TransformOptions struct {
 	ExportDir         string
 	TransformDir      string
 	PluginDir         string
-	IgnoredPatchesDir string
 	SkipPlugins       []string
 	OptionalFlags     string
-	Force             bool
+	Overwrite         bool
 	KustomizeArgs     string
 	InstructionsFile  string
 	Stages            []string
@@ -62,6 +61,7 @@ type ApplyOptions struct {
 	OutputDir         string
 	KustomizeArgs     string
 	SkipClusterScoped bool
+	Ordered           bool
 	Stages            []string
 }
 
@@ -117,17 +117,14 @@ func (c CraneRunner) Transform(opts TransformOptions) error {
 	if opts.PluginDir != "" {
 		args = append(args, "--plugin-dir", opts.PluginDir)
 	}
-	if opts.IgnoredPatchesDir != "" {
-		args = append(args, "--ignored-patches-dir", opts.IgnoredPatchesDir)
-	}
 	for _, p := range opts.SkipPlugins {
 		args = append(args, "--skip-plugins", p)
 	}
 	if opts.OptionalFlags != "" {
 		args = append(args, "--optional-flags", opts.OptionalFlags)
 	}
-	if opts.Force {
-		args = append(args, "--force")
+	if opts.Overwrite {
+		args = append(args, "--overwrite")
 	}
 	if opts.KustomizeArgs != "" {
 		args = append(args, "--kustomize-args", opts.KustomizeArgs)
@@ -166,6 +163,9 @@ func (c CraneRunner) Apply(opts ApplyOptions) error {
 	}
 	if opts.SkipClusterScoped {
 		args = append(args, "--skip-cluster-scoped")
+	}
+	if opts.Ordered {
+		args = append(args, "--ordered")
 	}
 	args = append(args, opts.Stages...)
 
