@@ -2,13 +2,17 @@ package transfer_pvc
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
+	rsynctransfer "github.com/migtools/pvc-transfer/transfer/rsync"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -38,7 +42,6 @@ func newTestScheme() *runtime.Scheme {
 	_ = batchv1.AddToScheme(s)
 	return s
 }
-
 
 func Test_parseSourceDestinationMapping(t *testing.T) {
 	tests := []struct {
@@ -176,6 +179,53 @@ func TestPodSpecReferencesPVC(t *testing.T) {
 			got := podSpecReferencesPVC(tt.spec, tt.pvcName)
 			if got != tt.want {
 				t.Errorf("podSpecReferencesPVC() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRestrictedContainersApplyTo(t *testing.T) {
+	tests := []struct {
+		name             string
+		restricted       bool
+		wantOmitDirTimes bool
+		wantBoolFields   bool
+	}{
+		{
+			name:             "expects --omit-dir-times in extras",
+			restricted:       true,
+			wantOmitDirTimes: true,
+			wantBoolFields:   false,
+		},
+		{
+			name:             "expects no --omit-dir-times",
+			restricted:       false,
+			wantOmitDirTimes: false,
+			wantBoolFields:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := rsynctransfer.CommandOptions{}
+			if err := restrictedContainers(tt.restricted).ApplyTo(&opts); err != nil {
+				t.Fatalf("ApplyTo() returned unexpected error: %v", err)
+			}
+			hasOmitDirTimes := slices.Contains(opts.Extras, "--omit-dir-times")
+			if hasOmitDirTimes != tt.wantOmitDirTimes {
+				t.Errorf("--omit-dir-times in extras = %v, want %v", hasOmitDirTimes, tt.wantOmitDirTimes)
+			}
+			for _, check := range []struct {
+				name string
+				got  bool
+			}{
+				{"Groups", opts.Groups},
+				{"Owners", opts.Owners},
+				{"DeviceFiles", opts.DeviceFiles},
+				{"SpecialFiles", opts.SpecialFiles},
+			} {
+				if check.got != tt.wantBoolFields {
+					t.Errorf("%s = %v, want %v", check.name, check.got, tt.wantBoolFields)
+				}
 			}
 		})
 	}
@@ -774,6 +824,268 @@ func TestTruncateWithHash(t *testing.T) {
 			again := truncateWithHash(tt.input)
 			if result != again {
 				t.Errorf("truncateWithHash() not deterministic: got %q then %q", result, again)
+			}
+		})
+	}
+}
+
+func TestIsIntraCluster(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  TransferPVCCommand
+		want bool
+	}{
+		{
+			name: "same cluster same namespace",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "cluster-a"},
+				destinationContext: &clientcmdapi.Context{Cluster: "cluster-a"},
+				Flags:              Flags{PVC: PvcFlags{Namespace: mappedNameVar{source: "ns1", destination: "ns1"}}},
+			},
+			want: true,
+		},
+		{
+			name: "same cluster different namespace",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "cluster-a"},
+				destinationContext: &clientcmdapi.Context{Cluster: "cluster-a"},
+				Flags:              Flags{PVC: PvcFlags{Namespace: mappedNameVar{source: "ns1", destination: "ns2"}}},
+			},
+			want: false,
+		},
+		{
+			name: "different cluster same namespace",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "cluster-a"},
+				destinationContext: &clientcmdapi.Context{Cluster: "cluster-b"},
+				Flags:              Flags{PVC: PvcFlags{Namespace: mappedNameVar{source: "ns1", destination: "ns1"}}},
+			},
+			want: false,
+		},
+		{
+			name: "nil source context",
+			cmd: TransferPVCCommand{
+				sourceContext:      nil,
+				destinationContext: &clientcmdapi.Context{Cluster: "cluster-a"},
+				Flags:              Flags{PVC: PvcFlags{Namespace: mappedNameVar{source: "ns1", destination: "ns1"}}},
+			},
+			want: false,
+		},
+		{
+			name: "nil destination context",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "cluster-a"},
+				destinationContext: nil,
+				Flags:              Flags{PVC: PvcFlags{Namespace: mappedNameVar{source: "ns1", destination: "ns1"}}},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cmd.isIntraClusterSameNamespace(); got != tt.want {
+				t.Errorf("isIntraClusterSameNamespace() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsSameNameIntraCluster(t *testing.T) {
+	tests := []struct {
+		name    string
+		cmd     TransferPVCCommand
+		wantErr bool
+	}{
+		{
+			name: "same name same cluster same namespace is rejected",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "c1"},
+				destinationContext: &clientcmdapi.Context{Cluster: "c1"},
+				Flags: Flags{PVC: PvcFlags{
+					Name:      mappedNameVar{source: "mysql-data", destination: "mysql-data"},
+					Namespace: mappedNameVar{source: "ns1", destination: "ns1"},
+				}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "no colon pvc-name same cluster same namespace is rejected",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "c1"},
+				destinationContext: &clientcmdapi.Context{Cluster: "c1"},
+				Flags: Flags{PVC: PvcFlags{
+					Name:      mappedNameVar{source: "mysql-data", destination: "mysql-data"},
+					Namespace: mappedNameVar{source: "ns1", destination: "ns1"},
+				}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "different name same cluster same namespace is allowed",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "c1"},
+				destinationContext: &clientcmdapi.Context{Cluster: "c1"},
+				Flags: Flags{
+					PVC: PvcFlags{
+						Name:      mappedNameVar{source: "mysql-data", destination: "mysql-data-new"},
+						Namespace: mappedNameVar{source: "ns1", destination: "ns1"},
+					},
+					Endpoint: EndpointFlags{Subdomain: "test.example.com"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "same name cross cluster is allowed",
+			cmd: TransferPVCCommand{
+				sourceContext:      &clientcmdapi.Context{Cluster: "c1"},
+				destinationContext: &clientcmdapi.Context{Cluster: "c2"},
+				Flags: Flags{
+					PVC: PvcFlags{
+						Name:      mappedNameVar{source: "mysql-data", destination: "mysql-data"},
+						Namespace: mappedNameVar{source: "ns1", destination: "ns1"},
+					},
+					Endpoint: EndpointFlags{Subdomain: "test.example.com"},
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cmd.Validate()
+			if tt.wantErr && err == nil {
+				t.Error("Validate() should have returned error but didn't")
+			}
+			if tt.wantErr && err != nil && !strings.Contains(err.Error(), "must differ") {
+				t.Errorf("Validate() returned unexpected error: %v", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate() returned unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestCertSecretNaming(t *testing.T) {
+	tests := []struct {
+		name         string
+		srcPVCName   string
+		destPVCName  string
+		serverSecret string
+		wantCopyName string
+	}{
+		{
+			name:         "same PVC name — keep original secret name",
+			srcPVCName:   "mydata",
+			destPVCName:  "mydata",
+			serverSecret: "stunnel-creds-certs-mydata",
+			wantCopyName: "stunnel-creds-certs-mydata",
+		},
+		{
+			name:         "different PVC name — rename to match client expectation",
+			srcPVCName:   "mydata",
+			destPVCName:  "mydata-renamed",
+			serverSecret: "stunnel-creds-certs-mydata-renamed",
+			wantCopyName: "stunnel-creds-certs-mydata",
+		},
+		{
+			name:         "intra-cluster SC conversion — rename to source PVC",
+			srcPVCName:   "redis-data",
+			destPVCName:  "redis-data-new",
+			serverSecret: "stunnel-creds-certs-redis-data-new",
+			wantCopyName: "stunnel-creds-certs-redis-data",
+		},
+		{
+			name:         "cross-cluster namespace mapping same name — keep original",
+			srcPVCName:   "data",
+			destPVCName:  "data",
+			serverSecret: "stunnel-creds-certs-data",
+			wantCopyName: "stunnel-creds-certs-data",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secretName := certificateSecretName(tt.serverSecret, tt.srcPVCName, tt.destPVCName)
+			if secretName != tt.wantCopyName {
+				t.Errorf("cert secret name = %q, want %q", secretName, tt.wantCopyName)
+			}
+		})
+	}
+}
+
+func TestStripServerManagedPVCAnnotations(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        map[string]string
+	}{
+		{
+			name:        "nil annotations",
+			annotations: nil,
+			want:        nil,
+		},
+		{
+			name:        "empty annotations",
+			annotations: map[string]string{},
+			want:        nil,
+		},
+		{
+			name: "only user annotations — all preserved",
+			annotations: map[string]string{
+				"backup.company.com/schedule":  "daily",
+				"backup.company.com/retention": "30d",
+				"storage.company.com/tier":     "premium",
+			},
+			want: map[string]string{
+				"backup.company.com/schedule":  "daily",
+				"backup.company.com/retention": "30d",
+				"storage.company.com/tier":     "premium",
+			},
+		},
+		{
+			name: "only server-managed annotations — all stripped",
+			annotations: map[string]string{
+				"pv.kubernetes.io/bind-completed":                   "yes",
+				"volume.kubernetes.io/storage-provisioner":          "ebs.csi.aws.com",
+				"volume.beta.kubernetes.io/storage-provisioner":     "kubernetes.io/gce-pd",
+				"kubectl.kubernetes.io/last-applied-configuration":  "{}",
+			},
+			want: nil,
+		},
+		{
+			name: "mixed — user preserved, server stripped",
+			annotations: map[string]string{
+				"backup.company.com/schedule":              "daily",
+				"pv.kubernetes.io/bind-completed":          "yes",
+				"volume.kubernetes.io/storage-provisioner": "ebs.csi.aws.com",
+				"app.kubernetes.io/managed-by":             "helm",
+			},
+			want: map[string]string{
+				"backup.company.com/schedule":  "daily",
+				"app.kubernetes.io/managed-by": "helm",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripServerManagedPVCAnnotations(tt.annotations)
+			if tt.want == nil && got != nil {
+				t.Errorf("want nil, got %v", got)
+				return
+			}
+			if tt.want != nil && got == nil {
+				t.Errorf("want %v, got nil", tt.want)
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("length mismatch: got %v, want %v", got, tt.want)
+				return
+			}
+			for k, v := range tt.want {
+				if got[k] != v {
+					t.Errorf("key %q: got %q, want %q", k, got[k], v)
+				}
 			}
 		})
 	}

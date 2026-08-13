@@ -123,7 +123,7 @@ var _ = Describe("Data validation with indirect migration of MySQL DB", func() {
 		Expect(err).NotTo(HaveOccurred())
 		exportOpts := ExportOptions{Namespace: srcApp.Namespace, ExportDir: paths.ExportDir}
 		transformOpts := TransformOptions{ExportDir: paths.ExportDir, TransformDir: paths.TransformDir}
-		applyOpts := ApplyOptions{ExportDir: paths.ExportDir, TransformDir: paths.TransformDir,
+		applyOpts := ApplyOptions{TransformDir: paths.TransformDir,
 			OutputDir: paths.OutputDir}
 
 		DeferCleanup(func() {
@@ -184,6 +184,15 @@ var _ = Describe("Data validation with indirect migration of MySQL DB", func() {
 		Expect(tgtpvcs).NotTo(BeEmpty(), "expected at least one PVC in target namespace %q", tgtApp.Namespace)
 		Expect(VerifyPVCsExistByName(pvcs, tgtpvcs)).NotTo(HaveOccurred())
 		log.Printf("Found %d PVCs in target namespace %q", len(tgtpvcs), tgtApp.Namespace)
+
+		By("Verify transferred PVCs contain data")
+		for _, pvc := range tgtpvcs {
+			mountPath := "/var/lib/mysql"
+			if strings.Contains(pvc.Name, "data1") {
+				mountPath = "/test-data"
+			}
+			Expect(VerifyPVCHasData(kubectlTgtNonAdmin, tgtApp.Namespace, pvc.Name, mountPath)).NotTo(HaveOccurred())
+		}
 
 		By("Apply rendered manifests to target")
 		log.Printf("Applying rendered manifests on target namespace %s from %s\n", tgtApp.Namespace, paths.OutputDir)
