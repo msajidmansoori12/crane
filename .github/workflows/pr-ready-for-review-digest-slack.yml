@@ -1,0 +1,159 @@
+# Daily Slack digest of open PRs labeled ready-for-review-notified.
+# Complements the per-PR /rfr notification in pr-ready-for-review-slack.yml.
+#
+# Setup:
+# 1. Create a Slack channel for the digest (e.g. application-migration-pr-digest).
+# 2. Create a Slack Workflow with a webhook trigger that posts the `data` field
+#    into that channel (same pattern as the existing ready-for-review notify).
+# 3. Add the trigger URL as repository secret SLACK_RFR_DIGEST_WEBHOOK_URL.
+#
+# Refs: https://github.com/migtools/crane/issues/812
+# Prefixes: https://github.com/konveyor/release-tools/blob/main/pkg/pr/prefix.go
+
+name: PR Ready For Review Daily Digest
+
+on:
+  schedule:
+    # Weekdays 13:00 UTC (~09:00 ET / ~18:30 IST). Adjust as needed.
+    - cron: "0 13 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-ready-for-review-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build digest message
+        id: digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Classify a PR title using Konveyor release-tools prefixes
+          # (shortcodes and emoji forms). Strips optional WIP / [tag] prefixes.
+          classify_type() {
+            local title="$1"
+            # Match release-tools: (?i)^\W?WIP\W then optional [tag] prefix.
+            title="$(printf '%s' "$title" | perl -pe 's/^\W?WIP\W//i')"
+            title="$(printf '%s' "$title" | sed -E 's/^\[[[:alnum:]._-]*\][[:space:]]*//')"
+            title="$(printf '%s' "$title" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+            case "$title" in
+              :sparkles:*|✨*)
+                echo "feature"
+                ;;
+              :bug:*|🐛*)
+                echo "bugfix"
+                ;;
+              :book:*|📖*)
+                echo "docs"
+                ;;
+              :seedling:*|🌱*)
+                echo "infra"
+                ;;
+              :warning:*|⚠*)
+                echo "breaking"
+                ;;
+              :ghost:*|👻*)
+                echo "nonote"
+                ;;
+              :test_tube:*|🧪*)
+                echo "test"
+                ;;
+              *)
+                echo "other"
+                ;;
+            esac
+          }
+
+          section_heading() {
+            case "$1" in
+              feature)  echo ":sparkles: Feature" ;;
+              breaking) echo ":warning: Breaking" ;;
+              bugfix)  echo ":bug: Bugfix" ;;
+              test)     echo ":test_tube: Test" ;;
+              docs)     echo ":book: Docs" ;;
+              infra)    echo ":seedling: Infra" ;;
+              nonote)   echo ":ghost: No note" ;;
+              other)    echo ":grey_question: Other" ;;
+            esac
+          }
+
+          # Fetch open, non-draft PRs with the ready-for-review-notified label.
+          prs_json="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --state open \
+            --label ready-for-review-notified \
+            --json number,title,url,author,isDraft \
+            --limit 200)"
+
+          prs_json="$(printf '%s' "$prs_json" | jq '[.[] | select(.isDraft == false)]')"
+          total="$(printf '%s' "$prs_json" | jq 'length')"
+
+          if [[ "${total}" -eq 0 ]]; then
+            echo "::notice::No open ready-for-review-notified PRs; skipping Slack post."
+            echo "should_notify=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Section order: feature first, then high-signal types, then the rest.
+          section_order=(feature breaking bugfix test docs infra nonote other)
+          declare -A section_lines
+
+          while IFS= read -r row; do
+            title="$(printf '%s' "$row" | jq -r '.title')"
+            url="$(printf '%s' "$row" | jq -r '.url')"
+            author="$(printf '%s' "$row" | jq -r '.author.login')"
+            pr_type="$(classify_type "$title")"
+
+            line="$(printf '• %s\n  %s | @%s' "$title" "$url" "$author")"
+            if [[ -n "${section_lines[$pr_type]:-}" ]]; then
+              section_lines[$pr_type]+=$'\n'"${line}"
+            else
+              section_lines[$pr_type]="${line}"
+            fi
+          done < <(printf '%s' "$prs_json" | jq -c '.[]')
+
+          message=":pr-open-1: Ready for Review Digest (${total} PR"
+          if [[ "${total}" -ne 1 ]]; then
+            message+="s"
+          fi
+          message+=$')\n'
+
+          for pr_type in "${section_order[@]}"; do
+            if [[ -z "${section_lines[$pr_type]:-}" ]]; then
+              continue
+            fi
+            message+=$'\n'"$(section_heading "$pr_type")"$'\n'
+            message+="${section_lines[$pr_type]}"$'\n'
+          done
+
+          echo "should_notify=true" >> "$GITHUB_OUTPUT"
+          delimiter="__CRANE_RFR_DIGEST_EOF__"
+          {
+            echo "message<<${delimiter}"
+            printf '%s' "$message"
+            echo
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack
+        if: steps.digest.outputs.should_notify == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_RFR_DIGEST_WEBHOOK_URL }}
+        uses: ./.github/actions/slack-incoming-webhook
+        with:
+          text: ${{ steps.digest.outputs.message }}
