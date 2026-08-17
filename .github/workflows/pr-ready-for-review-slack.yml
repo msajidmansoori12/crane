@@ -84,7 +84,7 @@ jobs:
           pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")"
           is_draft="$(printf '%s' "$pr_json" | jq -r '.draft')"
           pr_title="$(printf '%s' "$pr_json" | jq -r '.title')"
-          pr_url="$(printf '%s' "$pr_json" | jq -r '.html_url')"
+          pr_url="$(printf '%s' "$pr_json" | jq -r '.html_url')" 
 
           if [[ "$is_draft" == "true" ]]; then
             echo "::notice::PR #${pr_number} is still draft; skipping Slack notification."
